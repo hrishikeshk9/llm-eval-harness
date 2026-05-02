@@ -1,0 +1,75 @@
+name: Eval Gate
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/golden/**"
+      - "prompts/**"
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  eval:
+    name: Offline Eval
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # Full history needed to fetch baseline from main
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Fetch baseline report from main
+        run: |
+          git fetch origin main
+          git show origin/main:eval_baseline.json > /tmp/baseline.json 2>/dev/null || echo "{}" > /tmp/baseline.json
+
+      - name: Run offline eval
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
+          MILVUS_URI: ${{ secrets.MILVUS_URI }}
+          ES_URL: ${{ secrets.ES_URL }}
+        run: |
+          python -m pytest tests/eval/ -v \
+            --baseline=/tmp/baseline.json \
+            --report-output=/tmp/eval_report.json \
+            --pr-comment-output=/tmp/pr_comment.md \
+            2>&1 | tee /tmp/eval_log.txt
+          echo "EVAL_EXIT=$?" >> $GITHUB_ENV
+
+      - name: Post PR comment
+        if: always()
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          path: /tmp/pr_comment.md
+          header: eval-report
+
+      - name: Upload eval artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results-${{ github.sha }}
+          path: |
+            /tmp/eval_report.json
+            /tmp/eval_log.txt
+          retention-days: 30
+
+      - name: Fail on regression
+        if: env.EVAL_EXIT != '0'
+        run: |
+          echo "Eval gate failed — regressions detected. See PR comment for details."
+          exit 1
